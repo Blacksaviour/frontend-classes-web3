@@ -1,50 +1,545 @@
-import { PredictionMarketData, WalletState } from '../types/prediction';
+import { useState, useEffect, useCallback, useMemo } from "react";
+import {
+  BrowserProvider,
+  Contract,
+  JsonRpcSigner,
+  ZeroAddress,
+  formatEther,
+  parseEther,
+} from "ethers";
+import {
+  PREDICTION_HUB_ABI,
+  PREDICTION_HUB_ADDRESS,
+} from "../contracts/predictionConfig";
+import {
+  MarketOutcome,
+  PredictionMarketData,
+} from "../types/prediction";
 
-export const useWeb3Wallet = () => {
-  // TODO FOR ASSIGNMENT:
-  // 1. Detect window.ethereum
-  // 2. Connect via ethers.BrowserProvider
-  // 3. Keep track of address, network chainId, and ETH balance
-  
-  const wallet: WalletState = {
-    address: null,
-    chainId: null,
-    balance: '0.00',
-    isConnected: false,
-    isConnecting: false,
-    error: null,
-  };
 
-  const connectWallet = async () => {
-    console.log('Assignment TODO: Connect wallet using ethers BrowserProvider');
-  };
+export const EIP6963AnnounceProvider = "eip6963:announceProvider";
+export const EIP6963RequestProvider = "eip6963:requestProvider";
 
-  return { wallet, connectWallet };
+export const SUPPORTED_CHAINS = {
+  11155111: {
+    name: "Sepolia",
+    nativeCurrency: {
+      name: "Sepolia Ether",
+      symbol: "ETH",
+      decimals: 18,
+    },
+    rpcUrl: "https://rpc.sepolia.org",
+    blockExplorer: "https://sepolia.etherscan.io",
+  },
+} as const;
+
+type EIP1193Provider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+  on: (event: string, listener: (...args: any[]) => void) => void;
+  removeListener: (event: string, listener: (...args: any[]) => void) => void;
 };
 
-export const usePredictionMarket = (walletAddress: string | null) => {
-  // TODO FOR ASSIGNMENT:
-  // 1. Connect to PredictionMarketOracleHub contract using ethers.Contract
-  // 2. Fetch all markets using getAllMarkets()
-  // 3. For each market, read calculateWinnings() and userBets() for connected user
-  // 4. Implement event listeners for MarketCreated, BetPlaced, MarketResolved, WinningsClaimed
-  // 5. Implement placeBet(), claimWinnings(), and createMarket() (Owner mode)
-
-  const markets: PredictionMarketData[] = [];
-  const isLoading = false;
-  const error = null;
-
-  const placeBet = async (marketId: number, isYes: boolean, amountEth: string) => {
-    console.log('Assignment TODO: Execute placeBet transaction with msg.value');
+type EIP6963ProviderDetail = {
+  info: {
+    rdns: string;
   };
-
-  const claimWinnings = async (marketId: number) => {
-    console.log('Assignment TODO: Call claimWinnings and update UI state');
-  };
-
-  const createMarket = async (title: string, category: string, durationSeconds: number) => {
-    console.log('Assignment TODO: Call createMarket contract function');
-  };
-
-  return { markets, isLoading, error, placeBet, claimWinnings, createMarket };
+  provider: EIP1193Provider;
 };
+
+type EIP6963ProviderEvent = CustomEvent<EIP6963ProviderDetail>;
+
+type ProviderError = Error & {
+  code?: number;
+};
+
+type ChainConfig = {
+  name: string;
+  nativeCurrency: {
+    name: string;
+    symbol: string;
+    decimals: number;
+  };
+  rpcUrl: string;
+  blockExplorer: string;
+};
+
+type SupportedChains = Record<number, ChainConfig>;
+
+const chains = SUPPORTED_CHAINS as SupportedChains;
+
+export const usePredictionMarket = () => {
+  const [account, setAccount] = useState<string | null>(null);
+  const [signer, setSigner] = useState<JsonRpcSigner | null>(null);
+  const [balance, setBalance] = useState<string | null>(null);
+  const [chainId, setChainId] = useState<number | null>(null);
+  const [browserProvider, setBrowserProvider] =
+    useState<BrowserProvider | null>(null);
+  const [provider, setProvider] = useState<EIP1193Provider | null>(null);
+  const [isRefreshingBalance, setIsRefreshingBalance] =
+    useState<boolean>(false);
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [markets, setMarkets] = useState<PredictionMarketData[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  const isSupportedChain = useMemo(() => {
+    if (!chainId) {
+      return false;
+    }
+    return Boolean(chains[chainId]);
+  }, [chainId]);
+
+  const currentChain = useMemo(() => {
+    if (!chainId) {
+      return null;
+    }
+    return chains[chainId] || null;
+  }, [chainId]);
+
+  const setAccountAndSigner = useCallback(
+    async (accounts: string[]): Promise<void> => {
+      if (browserProvider && accounts.length > 0) {
+        const newAccount = accounts[0];
+        setAccount(newAccount);
+        const signer = await browserProvider.getSigner(newAccount);
+        setSigner(signer);
+      } else {
+        setAccount(null);
+        setSigner(null);
+        setBalance(null);
+      }
+    },
+    [browserProvider]
+  );
+
+  const getBalance = useCallback(async (): Promise<void> => {
+    if (!browserProvider || !account) {
+      return;
+    }
+
+    try {
+      setIsRefreshingBalance(true);
+
+      const network = await browserProvider.getNetwork();
+
+      if (!chains[Number(network.chainId)]) {
+        setBalance(null);
+        return;
+      }
+
+      const balance = await browserProvider.getBalance(account);
+
+      setBalance(Number(formatEther(balance)).toFixed(5));
+    } catch (error: unknown) {
+      console.error("Failed to fetch balance:", error);
+
+      setBalance(null);
+    } finally {
+      setIsRefreshingBalance(false);
+    }
+  }, [browserProvider, account]);
+
+  const fetchMarkets = useCallback(async (): Promise<void> => {
+    if (!browserProvider) {
+      setMarkets([]);
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      setError(null);
+
+     
+      const contract = new Contract(
+        PREDICTION_HUB_ADDRESS,
+        PREDICTION_HUB_ABI,
+        browserProvider
+      );
+      const rawMarkets = await contract.getAllMarkets();
+      const userAddress = account || ZeroAddress;
+
+      const nextMarkets = await Promise.all(
+        rawMarkets.map(async (rawMarket: any): Promise<PredictionMarketData> => {
+          const marketId = Number(rawMarket.id);
+          const userBet = await contract.userBets(marketId, userAddress);
+          const userEstimatedWinnings =
+            rawMarket.resolved && account
+              ? await contract.calculateWinnings(marketId, account)
+              : 0n;
+          const endTime = Number(rawMarket.endTime);
+
+          return {
+            id: marketId,
+            title: rawMarket.title,
+            category: rawMarket.category,
+            endTime,
+            outcome: Number(rawMarket.outcome) as MarketOutcome,
+            totalYesPool: formatEther(rawMarket.totalYesPool),
+            totalNoPool: formatEther(rawMarket.totalNoPool),
+            resolved: rawMarket.resolved,
+            userYesBet: formatEther(userBet.yesAmount),
+            userNoBet: formatEther(userBet.noAmount),
+            userClaimed: userBet.claimed,
+            userEstimatedWinnings: formatEther(userEstimatedWinnings),
+            isExpired: endTime <= Math.floor(Date.now() / 1000),
+          };
+        })
+      );
+
+      setMarkets(nextMarkets);
+    } catch (fetchError: unknown) {
+      console.error("Failed to fetch prediction markets:", fetchError);
+      setMarkets([]);
+      setError(
+        fetchError instanceof Error
+          ? fetchError.message
+          : "Failed to fetch prediction markets."
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  }, [browserProvider, account]);
+
+  const placeBet = useCallback(
+    async (
+      marketId: number,
+      isYes: boolean,
+      amountEth: string
+    ): Promise<void> => {
+      if (!signer) {
+        throw new Error("Connect your wallet before placing a bet.");
+      }
+
+      try {
+        setError(null);
+
+        const contract = new Contract(
+          PREDICTION_HUB_ADDRESS,
+          PREDICTION_HUB_ABI,
+          signer
+        );
+        const transaction = await contract.placeBet(marketId, isYes, {
+          value: parseEther(amountEth),
+        });
+
+        await transaction.wait();
+        await Promise.all([fetchMarkets(), getBalance()]);
+      } catch (betError: unknown) {
+        console.error("Failed to place bet:", betError);
+        const message =
+          betError instanceof Error
+            ? betError.message
+            : "Failed to place bet.";
+        setError(message);
+        throw betError;
+      }
+    },
+    [signer, fetchMarkets, getBalance]
+  );
+
+  const claimWinnings = useCallback(
+    async (marketId: number): Promise<void> => {
+      if (!signer) {
+        throw new Error("Connect your wallet before claiming winnings.");
+      }
+
+      try {
+        setError(null);
+
+        const contract = new Contract(
+          PREDICTION_HUB_ADDRESS,
+          PREDICTION_HUB_ABI,
+          signer
+        );
+        const transaction = await contract.claimWinnings(marketId);
+
+        await transaction.wait();
+        await Promise.all([fetchMarkets(), getBalance()]);
+      } catch (claimError: unknown) {
+        console.error("Failed to claim winnings:", claimError);
+        const message =
+          claimError instanceof Error
+            ? claimError.message
+            : "Failed to claim winnings.";
+        setError(message);
+        throw claimError;
+      }
+    },
+    [signer, fetchMarkets, getBalance]
+  );
+
+  const switchChain = useCallback(
+    async (targetChainId: number): Promise<void> => {
+      if (!provider) {
+        throw new Error("No wallet provider detected.");
+      }
+
+      const chain = chains[targetChainId];
+      if (!chain) {
+        throw new Error(
+          `Chain ${targetChainId} is not supported by this application.`
+        );
+      }
+
+      const hexChainId = `0x${targetChainId.toString(16)}`;
+      try {
+        await provider.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: hexChainId }],
+        });
+      } catch (error: unknown) {
+        /** * Error 4902 means the wallet does not know * about this chain yet. * * Ask the wallet to add it. */
+        // Check for all error codes here https://eips.ethereum.org/EIPS/eip-1193 under the Provider Errors;
+        const providerError = error as ProviderError;
+
+        if (providerError.code === 4902) {
+          await provider.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId: hexChainId,
+                chainName: chain.name,
+                nativeCurrency: chain.nativeCurrency,
+                rpcUrls: [chain.rpcUrl],
+                blockExplorerUrls: [chain.blockExplorer],
+              },
+            ],
+          });
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: hexChainId }],
+          });
+        } else {
+          throw error;
+        }
+      }
+    },
+    [provider]
+  );
+
+  const validateChainId = useCallback((): boolean => {
+    if (!chainId) {
+      return false;
+    }
+
+    return Boolean(chains[chainId]);
+  }, [chainId]);
+
+  const connectWallet = useCallback(async (): Promise<void> => {
+    if (!browserProvider) {
+      throw new Error("No wallet provider detected.");
+    }
+    setIsConnecting(true);
+    try {
+      const accounts = (await browserProvider.send(
+        "eth_requestAccounts",
+        []
+      )) as string[];
+      await setAccountAndSigner(accounts);
+      const network = await browserProvider.getNetwork();
+      setChainId(Number(network.chainId));
+    } catch (error: any) {
+      setError(
+        error && error.message
+          ? error.message
+          : "An unexpected error occured, please try again"
+      );
+    } finally {
+      setIsConnecting(false);
+    }
+  }, [browserProvider, setAccountAndSigner]);
+
+  const disconnectWallet = useCallback(async (): Promise<void> => {
+    try {
+      if (provider) {
+        await provider.request({
+          method: "wallet_revokePermissions",
+          params: [{ eth_accounts: {} }],
+        });
+      }
+    } catch (error: unknown) {
+      console.error("Failed to revoke wallet permission:", error);
+    }
+
+    setAccount(null);
+    setSigner(null);
+    setChainId(null);
+    setBalance(null);
+  }, [provider]);
+
+  const handleAccountsChanged = useCallback(
+    async (accounts: string[]): Promise<void> => {
+      await setAccountAndSigner(accounts);
+
+      if (accounts.length == 0) {
+        setChainId(null);
+        setBalance(null);
+      }
+    },
+    [setAccountAndSigner]
+  );
+
+  const handleChainChanged = useCallback(
+    (newChainId: string): void => {
+      setChainId(parseInt(newChainId, 16));
+
+      setBalance(null);
+      if (provider) {
+        setBrowserProvider(new BrowserProvider(provider as any));
+      }
+    },
+    [provider]
+  );
+
+  const handleDisconnect = useCallback(
+    async (error: unknown): Promise<void> => {
+      console.error("Wallet disocnnected with error: ", error);
+      await disconnectWallet();
+      console.log("handle disconnect successful...");
+    },
+    [disconnectWallet]
+  );
+
+  useEffect(() => {
+    const init = async (): Promise<void> => {
+      if (!browserProvider) {
+        return;
+      }
+
+      console.log("browserProvider is nowwwwwwwwww set....");
+      const accounts = (await browserProvider.send(
+        "eth_accounts",
+        []
+      )) as string[];
+
+      if (accounts.length == 0) {
+        return;
+      }
+      await setAccountAndSigner(accounts);
+
+      const network = await browserProvider.getNetwork();
+      setChainId(Number(network.chainId));
+    };
+
+    if (!browserProvider) {
+      console.log("browserProvider is not set....");
+      return;
+    }
+
+    init();
+  }, [browserProvider, setAccountAndSigner]);
+
+  useEffect(() => {
+    if (!provider) {
+      return;
+    }
+
+    provider.on("chainChanged", handleChainChanged);
+    provider.on("accountsChanged", handleAccountsChanged);
+    provider.on("disconnect", handleDisconnect);
+
+    return () => {
+      provider.removeListener("chainChanged", handleChainChanged);
+      provider.removeListener("accountsChanged", handleAccountsChanged);
+      provider.removeListener("disconnect", handleDisconnect);
+    };
+  }, [provider, handleAccountsChanged, handleChainChanged, handleDisconnect]);
+
+  useEffect(() => {
+    if (!account || !browserProvider) {
+      return;
+    }
+    getBalance();
+  }, [account, browserProvider, getBalance]);
+
+  useEffect(() => {
+    fetchMarkets();
+  }, [fetchMarkets]);
+
+  useEffect(() => {
+    if (!browserProvider) {
+      return;
+    }
+
+    const contract = new Contract(
+      PREDICTION_HUB_ADDRESS,
+      PREDICTION_HUB_ABI,
+      browserProvider
+    );
+    const refreshMarkets = (): void => {
+      void fetchMarkets();
+    };
+
+    contract.on("MarketCreated", refreshMarkets);
+    contract.on("BetPlaced", refreshMarkets);
+    contract.on("MarketResolved", refreshMarkets);
+    contract.on("WinningsClaimed", refreshMarkets);
+
+    return () => {
+      contract.off("MarketCreated", refreshMarkets);
+      contract.off("BetPlaced", refreshMarkets);
+      contract.off("MarketResolved", refreshMarkets);
+      contract.off("WinningsClaimed", refreshMarkets);
+    };
+  }, [browserProvider, fetchMarkets]);
+
+  useEffect(() => {
+    const handleProviderAnnouncement = (event: Event): void => {
+      const providerEvent = event as EIP6963ProviderEvent;
+
+      const walletRdns = providerEvent.detail.info.rdns;
+      if (walletRdns === "io.metamask" || walletRdns === "com.brave.wallet") {
+        const injectedProvider = providerEvent.detail.provider;
+
+        setProvider(injectedProvider);
+        setBrowserProvider(new BrowserProvider(injectedProvider as any));
+      }
+    };
+
+    window.addEventListener(
+      EIP6963AnnounceProvider,
+      handleProviderAnnouncement
+    );
+
+    window.dispatchEvent(new Event(EIP6963RequestProvider));
+
+    return () => {
+      window.removeEventListener(
+        EIP6963AnnounceProvider,
+        handleProviderAnnouncement
+      );
+    };
+  }, []);
+
+  return {
+    wallet: {
+      address: account,
+      chainId,
+      balance,
+      isConnected: !!account,
+      isConnecting,
+      error,
+    },
+    provider,
+    browserProvider,
+    signer,
+
+    chainId,
+    isSupportedChain,
+    currentChain,
+    supportedChains: SUPPORTED_CHAINS,
+
+    connectWallet,
+    disconnectWallet,
+    getBalance,
+    fetchMarkets,
+    placeBet,
+    claimWinnings,
+    markets,
+    isLoading,
+    switchNetwork: switchChain,
+    validateChainId,
+  };
+};
+
+export const useWeb3Wallet = usePredictionMarket;

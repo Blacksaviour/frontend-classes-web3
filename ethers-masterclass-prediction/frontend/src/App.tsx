@@ -1,14 +1,20 @@
 import React, { useState } from 'react';
 import { Header } from './components/Header';
 import { MarketCard } from './components/MarketCard';
-import { useWeb3Wallet, usePredictionMarket } from './hooks/useWeb3Prediction';
+import { useWeb3Wallet } from './hooks/useWeb3Prediction';
 import { PredictionMarketData, MarketOutcome } from './types/prediction';
 import { AlertCircle, Plus, Loader2, ArrowUpRight, ShieldCheck, Zap, BarChart3, TrendingUp, Compass } from 'lucide-react';
 
 export function App() {
-  const { wallet, connectWallet } = useWeb3Wallet();
-  const { markets, isLoading, error, placeBet, claimWinnings } =
-    usePredictionMarket(wallet.address);
+  const {
+    wallet,
+    connectWallet,
+    markets,
+    isLoading,
+    placeBet,
+    claimWinnings,
+  } = useWeb3Wallet();
+  const error = wallet.error;
 
   const [activeCategory, setActiveCategory] = useState<string>('ALL');
 
@@ -70,7 +76,7 @@ export function App() {
 
   return (
     <div className="min-h-screen subtle-mesh-bg text-slate-900 flex flex-col font-sans selection:bg-indigo-500 selection:text-white">
-      <Header wallet={wallet} onConnect={connectWallet} />
+      <Header wallet={{ ...wallet, balance: wallet.balance ?? '0' }} onConnect={connectWallet} />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-8 py-8 space-y-8">
         
